@@ -27,7 +27,7 @@ Entrée CG → Parseur
    Recherche Minimax / Alpha–Bêta (+ table)
               │
               ▼
-   Coup sélectionné → Sortie CG (⩽ 95 ms)
+   Coup sélectionné → Sortie (⩽ 95 ms)
 ```
 
 ## 4. Parcours du code
