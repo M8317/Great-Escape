@@ -1,0 +1,496 @@
+import sys
+import math
+import time
+from collections import deque
+
+# ==============================
+#  PARAMÈTRES INITIAUX
+# ==============================
+w, h, player_count, my_id = [int(i) for i in input().split()]
+
+# Temps max pour la boucle par tour (CodinGame ~ 50ms - 100ms)
+TIME_LIMIT = 0.095  # en secondes (ajustez selon la marge)
+
+# Paramètres
+MAX_DEPTH = 5  # profondeur max possible (on tentera iteratively jusqu'à 5)
+WALLS_TO_TRY = 4  # limiter le nb de placements de murs testés
+USE_TRANSPOSITION = True
+
+# ==============================
+#  GESTION DE LA TRANSPOSITION
+# ==============================
+# On stocke: transpo[(hash_state, depth)] = (score, best_move, flag)
+#   - flag peut être "exact", "lower_bound", "upper_bound" pour alpha-beta
+# Ici, on fait simple: (score, best_move).
+transposition_table = {}
+
+def compute_state_hash(positions, walls_h, walls_v, walls_left, current_player):
+    """
+    Exemple minimal de hash (pas un vrai Zobrist) :
+    On concatène :
+     - positions
+     - sorted list de murs h
+     - sorted list de murs v
+     - walls_left
+     - current_player
+    => Vous pouvez utiliser un vrai hash (md5, etc.) pour plus de fiabilité.
+    """
+    hstr = []
+    # positions
+    for (x,y) in positions:
+        hstr.append(f"{x},{y}")
+    # murs
+    for (wx, wy) in sorted(walls_h):
+        hstr.append(f"H{wx},{wy}")
+    for (wx, wy) in sorted(walls_v):
+        hstr.append(f"V{wx},{wy}")
+    # walls_left
+    for wq in walls_left:
+        hstr.append(str(wq))
+    hstr.append(str(current_player))
+    key = "|".join(hstr)
+    return key
+
+# ==============================
+#  GESTION DES MURS
+# ==============================
+def get_neighbors(x, y, walls_h, walls_v):
+    """Retourne la liste (nx, ny) atteignables depuis (x,y) sans traverser de mur."""
+    res = []
+    # UP
+    if y - 1 >= 0 and (x, y - 1) not in walls_h:
+        res.append((x, y - 1))
+    # DOWN
+    if y + 1 < h and (x, y) not in walls_h:
+        res.append((x, y + 1))
+    # LEFT
+    if x - 1 >= 0 and (x - 1, y) not in walls_v:
+        res.append((x - 1, y))
+    # RIGHT
+    if x + 1 < w and (x, y) not in walls_v:
+        res.append((x + 1, y))
+    return res
+
+def bfs_distance(x, y, target_row, walls_h, walls_v):
+    """Distance BFS de (x,y) jusqu'à 'target_row' (ex. h-1). 999 si bloqué."""
+    visited = set()
+    queue = deque()
+    queue.append((x, y, 0))
+    visited.add((x,y))
+    while queue:
+        cx, cy, dist = queue.popleft()
+        if cy == target_row:
+            return dist
+        for (nx, ny) in get_neighbors(cx, cy, walls_h, walls_v):
+            if (nx, ny) not in visited:
+                visited.add((nx, ny))
+                queue.append((nx, ny, dist+1))
+    return 999
+
+def can_reach_all(positions, walls_h, walls_v):
+    """Vérifie que chaque joueur (2 joueurs dans cet ex.) peut atteindre sa ligne d'arrivée."""
+    # Joueur 0 => y=h-1, Joueur 1 => y=0 (adaptation simple 1v1)
+    (x0, y0), (x1, y1) = positions
+    dist0 = bfs_distance(x0, y0, h-1, walls_h, walls_v)
+    if dist0 == 999:
+        return False
+    dist1 = bfs_distance(x1, y1, 0, walls_h, walls_v)
+    if dist1 == 999:
+        return False
+    return True
+
+# ==============================
+#  SUPERPOSITION / CROISEMENT
+# ==============================
+def walls_conflict(state, orient, wx, wy):
+    """
+    Vérifie la superposition et le croisement direct.
+    Dans Quoridor:
+      - Un mur horizontal (wx,wy) occupe (wx,wy) et (wx+1,wy) 
+        => conflict si un mur horizontal ou vertical occupe ces segments de manière incompatible.
+      - Idem en vertical (wx,wy) et (wx,wy+1).
+    Simplification : On check si (wx,wy) + (wx+1,wy) (ou le pair) 
+                     sont déjà dans walls_h ou walls_v.
+    """
+    walls_h = state["walls_h"]
+    walls_v = state["walls_v"]
+
+    if orient == 'H':
+        # On veut ajouter (wx,wy) dans walls_h
+        # => check si (wx, wy) ou (wx+1, wy) déjà dans walls_h => superposition
+        if (wx, wy) in walls_h or (wx+1, wy) in walls_h:
+            return True
+        # Check croisement => un mur vertical occupant la même zone ?
+        # Théoriquement, un mur vertical (wx, wy) recouvre (wx,wy)-(wx,wy+1). 
+        # Le croisement se produit si un mur V est à (wx, wy) ou (wx, wy-1) ?
+        # Il y a plusieurs façons de gérer ces collisions. On va faire un check naïf.
+        if (wx, wy) in walls_v or (wx+1, wy) in walls_v:
+            return True
+        return False
+    else:
+        # orient='V'
+        # On veut ajouter (wx,wy) dans walls_v
+        if (wx, wy) in walls_v or (wx, wy+1) in walls_v:
+            return True
+        # Check croisement => un mur horizontal occupant la même zone ?
+        if (wx, wy) in walls_h or (wx, wy+1) in walls_h:
+            return True
+        return False
+
+def is_valid_wall(state, orient, wx, wy):
+    """Vérifie :
+       1) bornes
+       2) pas de superposition/croisement
+       3) pas de blocage complet."""
+    # 1) Bornes
+    if orient == 'H':
+        if not (0 <= wx < w-1 and 0 <= wy < h):
+            return False
+    else:  # 'V'
+        if not (0 <= wx < w and 0 <= wy < h-1):
+            return False
+
+    # 2) Superposition / croisement
+    if walls_conflict(state, orient, wx, wy):
+        return False
+
+    # 3) Blocage total
+    # On modifie temporairement walls_h ou walls_v
+    wh = set(state["walls_h"])
+    wv = set(state["walls_v"])
+    if orient == 'H':
+        wh.add((wx, wy))
+        wh.add((wx+1, wy))  # pour refléter la double case d'un mur horizontal
+    else:
+        wv.add((wx, wy))
+        wv.add((wx, wy+1))  # refléter la double case d'un mur vertical
+
+    positions = state["positions"]
+    if not can_reach_all(positions, wh, wv):
+        return False
+    return True
+
+# ==============================
+#  FONCTION D'ÉVALUATION
+# ==============================
+def evaluate_state(state):
+    """
+    Évaluation améliorée:
+      - distance BFS de mon pion vers son but
+      - distance BFS de l'adversaire vers son but
+      - mes murs restants, murs adverses
+      - petite pénalité si j'ai trop tardé
+    """
+    (x0,y0), (x1,y1) = state["positions"]
+    wh = state["walls_h"]
+    wv = state["walls_v"]
+    wleft = state["walls_left"]
+    # BFS distance
+    dist0 = bfs_distance(x0, y0, h-1, wh, wv)  # Joueur0 => y=h-1
+    dist1 = bfs_distance(x1, y1, 0,   wh, wv)  # Joueur1 => y=0
+
+    # Score
+    # Hypothèse: my_id=0 => je veux minimiser dist0 et maximiser dist1
+    # my_id=1 => je veux minimiser dist1 et maximiser dist0
+    # On intègre un bonus pour mes murs restants, un malus pour ceux de l'adversaire.
+    # On ajoute un petit "turn penalty" pour privilégier les solutions rapides.
+
+    turn_penalty = state.get("turn_number", 0)  # plus tard on joue, plus on pénalise
+
+    if my_id == 0:
+        score = (dist1 - dist0)*10 + (wleft[0] - wleft[1])*2 - turn_penalty*0.1
+    else:
+        score = (dist0 - dist1)*10 + (wleft[1] - wleft[0])*2 - turn_penalty*0.1
+
+    return score
+
+# ==============================
+#  GÉNÉRATION DES COUPS
+# ==============================
+def get_all_moves(state):
+    """
+    Génère ("MOVE", dir_str) ou ("WALL", wx, wy, orient).
+    On limite la pose de murs (WALLS_TO_TRY).
+    """
+    moves = []
+    cur = state["current_player"]
+    positions = state["positions"]
+    (x0, y0), (x1, y1) = positions
+    if cur == 0:
+        my_x, my_y = x0, y0
+    else:
+        my_x, my_y = x1, y1
+
+    # 1) Mouvements
+    #   On regarde get_neighbors(my_x, my_y, ...)
+    for (nx, ny) in get_neighbors(my_x, my_y, state["walls_h"], state["walls_v"]):
+        dx = nx - my_x
+        dy = ny - my_y
+        if dx == 0 and dy == -1:
+            moves.append(("MOVE","UP"))
+        elif dx == 0 and dy == 1:
+            moves.append(("MOVE","DOWN"))
+        elif dx == -1 and dy == 0:
+            moves.append(("MOVE","LEFT"))
+        elif dx == 1 and dy == 0:
+            moves.append(("MOVE","RIGHT"))
+
+    # 2) Placement de murs (si on a encore des murs)
+    if state["walls_left"][cur] > 0:
+        # On cible la zone autour de l'adversaire
+        opp = 1 - cur
+        ox, oy = positions[opp]
+        candidates = []
+        for dx in range(-2,3):
+            for dy in range(-2,3):
+                wxx = ox + dx
+                wyy = oy + dy
+                candidates.append(("H", wxx, wyy))
+                candidates.append(("V", wxx, wyy))
+        # On trie par distance à (ox, oy)
+        def dist_to_opp(c):
+            (o, xx, yy) = c
+            return abs(xx-ox)+abs(yy-oy)
+        candidates.sort(key=dist_to_opp)
+        candidates = candidates[:WALLS_TO_TRY]
+
+        # Vérification
+        for (o, xx, yy) in candidates:
+            if is_valid_wall(state, o, xx, yy):
+                moves.append(("WALL", xx, yy, o))
+
+    return moves
+
+# ==============================
+#  APPLIQUER / ANNULER UN COUP
+# ==============================
+def apply_move(state, move):
+    """Modifie l'état en place (pour minimax)."""
+    cur = state["current_player"]
+    (x0,y0), (x1,y1) = state["positions"]
+    if cur == 0:
+        my_x, my_y = x0, y0
+    else:
+        my_x, my_y = x1, y1
+
+    if move[0] == "MOVE":
+        dir_str = move[1]
+        if dir_str == "UP":
+            my_y -= 1
+        elif dir_str == "DOWN":
+            my_y += 1
+        elif dir_str == "LEFT":
+            my_x -= 1
+        elif dir_str == "RIGHT":
+            my_x += 1
+        if cur == 0:
+            state["positions"] = [(my_x,my_y),(x1,y1)]
+        else:
+            state["positions"] = [(x0,y0),(my_x,my_y)]
+    else:
+        # WALL
+        _, wx, wy, orient = move
+        if orient == 'H':
+            # On ajoute 2 segments
+            state["walls_h"].add((wx, wy))
+            state["walls_h"].add((wx+1, wy))
+        else:
+            state["walls_v"].add((wx, wy))
+            state["walls_v"].add((wx, wy+1))
+        state["walls_left"][cur] -= 1
+
+    state["current_player"] = 1 - cur
+    state["turn_number"] = state.get("turn_number",0) + 1
+
+def undo_move(state, move):
+    """Annule le coup pour revenir à l'état précédent (évite le clonage)."""
+    # On refait l'inverse de apply_move
+    prev_player = 1 - state["current_player"]
+    state["current_player"] = prev_player
+    (x0,y0), (x1,y1) = state["positions"]
+    turn_nb = state.get("turn_number",0)
+    state["turn_number"] = turn_nb - 1 if turn_nb>0 else 0
+
+    if move[0] == "MOVE":
+        # On va inverser le déplacement
+        if prev_player == 0:
+            my_x, my_y = x0, y0
+        else:
+            my_x, my_y = x1, y1
+
+        dir_str = move[1]
+        if dir_str == "UP":
+            my_y += 1
+        elif dir_str == "DOWN":
+            my_y -= 1
+        elif dir_str == "LEFT":
+            my_x += 1
+        elif dir_str == "RIGHT":
+            my_x -= 1
+
+        if prev_player == 0:
+            state["positions"] = [(my_x,my_y),(x1,y1)]
+        else:
+            state["positions"] = [(x0,y0),(my_x,my_y)]
+    else:
+        # WALL
+        _, wx, wy, orient = move
+        if orient == 'H':
+            state["walls_h"].remove((wx, wy))
+            state["walls_h"].remove((wx+1, wy))
+        else:
+            state["walls_v"].remove((wx, wy))
+            state["walls_v"].remove((wx, wy+1))
+        state["walls_left"][prev_player] += 1
+
+# ==============================
+#  DETECTION DE FIN
+# ==============================
+def is_terminal(state):
+    # Joueur0 => y=h-1 ? Joueur1 => y=0 ?
+    (x0,y0),(x1,y1) = state["positions"]
+    if y0 == h-1 or y1 == 0:
+        return True
+    return False
+
+# ==============================
+#  ALPHA-BETA
+# ==============================
+def alpha_beta(state, depth, alpha, beta, start_time):
+    """Retourne (score, move)."""
+    # Check temps
+    if (time.time() - start_time) > TIME_LIMIT:
+        # On arrête l'explo, renvoie juste l'évaluation
+        sc = evaluate_state(state)
+        return (sc, None)
+
+    if depth == 0 or is_terminal(state):
+        sc = evaluate_state(state)
+        return (sc, None)
+
+    # Transposition check
+    if USE_TRANSPOSITION:
+        state_hash = compute_state_hash(state["positions"], state["walls_h"], state["walls_v"],
+                                        state["walls_left"], state["current_player"])
+        if (state_hash, depth) in transposition_table:
+            (cached_score, cached_move) = transposition_table[(state_hash, depth)]
+            return (cached_score, cached_move)
+
+    cur = state["current_player"]
+    is_max = (cur == my_id)
+
+    moves = get_all_moves(state)
+    if not moves:
+        # Pas de coup => éval
+        sc = evaluate_state(state)
+        # on stocke
+        if USE_TRANSPOSITION:
+            transposition_table[(state_hash, depth)] = (sc, None)
+        return (sc, None)
+
+    best_move = None
+
+    if is_max:
+        value = -math.inf
+        for mv in moves:
+            apply_move(state, mv)
+            (child_val, _) = alpha_beta(state, depth-1, alpha, beta, start_time)
+            undo_move(state, mv)
+            if child_val > value:
+                value = child_val
+                best_move = mv
+            alpha = max(alpha, value)
+            if alpha >= beta:
+                break
+    else:
+        value = math.inf
+        for mv in moves:
+            apply_move(state, mv)
+            (child_val, _) = alpha_beta(state, depth-1, alpha, beta, start_time)
+            undo_move(state, mv)
+            if child_val < value:
+                value = child_val
+                best_move = mv
+            beta = min(beta, value)
+            if alpha >= beta:
+                break
+
+    # Store in transposition
+    if USE_TRANSPOSITION:
+        state_hash = compute_state_hash(state["positions"], state["walls_h"], state["walls_v"],
+                                        state["walls_left"], state["current_player"])
+        transposition_table[(state_hash, depth)] = (value, best_move)
+
+    return (value, best_move)
+
+# ==============================
+#  BOUCLE PRINCIPALE
+# ==============================
+while True:
+    players_info = []
+    for i in range(player_count):
+        px, py, wleft = map(int, input().split())
+        players_info.append((px, py, wleft))
+
+    wall_count = int(input())
+    walls_h = set()
+    walls_v = set()
+    for _ in range(wall_count):
+        wx, wy, o = input().split()
+        wx, wy = int(wx), int(wy)
+        if o == 'H':
+            # On considère un mur horizontal occupe (wx,wy) et (wx+1,wy)
+            walls_h.add((wx, wy))
+            walls_h.add((wx+1, wy))
+        else:
+            walls_v.add((wx, wy))
+            walls_v.add((wx, wy+1))
+
+    # Positions
+    (x0, y0, w0) = players_info[0]
+    (x1, y1, w1) = players_info[1] if player_count>1 else (0, 0, 0)
+
+    state = {
+        "positions": [(x0,y0),(x1,y1)],
+        "walls_h": walls_h,
+        "walls_v": walls_v,
+        "walls_left": [w0, w1],
+        "current_player": my_id,
+        "turn_number": 0
+    }
+
+    # Recherche itérative
+    start_time = time.time()
+    best_move_found = None
+    best_score = -math.inf if my_id==0 else math.inf
+
+    # On vide la transposition table à chaque tour pour simplifier 
+    # (on pourrait la garder sur plusieurs tours, mais ça peut être risqué 
+    #  si l'état n'est pas exactement le même hashing).
+    transposition_table.clear()
+
+    for depth in range(1, MAX_DEPTH+1):
+        if (time.time() - start_time) > (TIME_LIMIT * 0.5):
+            # on garde un peu de marge
+            break
+        (val, mv) = alpha_beta(state, depth, -math.inf, math.inf, start_time)
+        if mv is not None:
+            best_move_found = mv
+            best_score = val
+        # Si on veut faire un critère d'arrêt (ex: val = +inf ou -inf), on peut.
+
+    if best_move_found is None:
+        # Aucun coup => par défaut "RIGHT"
+        print("RIGHT")
+        continue
+
+    if best_move_found[0] == "MOVE":
+        print(best_move_found[1])
+    else:
+        # ("WALL", x, y, orient)
+        _, wx, wy, o = best_move_found
+        # Pour l'affichage final sur CodinGame, on n'affiche qu'une seule coord
+        # (wx, wy) et orientation. 
+        # Mais ATTENTION: plus haut, on a stocké (wx,wy) et (wx+1,wy) par ex.
+        # => on affiche juste la "position de départ" du mur.
+        print(f"{wx} {wy} {o}")
