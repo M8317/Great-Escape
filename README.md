@@ -1,4 +1,4 @@
-# Bot *Great Escape* – README (FR)
+# Bot *Great Escape* 
 
 ## 1. Objet du projet
 
