@@ -93,10 +93,5 @@ python bot.py < entree.txt > sortie.txt
 
 ## 7. Pistes d’amélioration
 
-* **Hash Zobrist** pour une mise à jour O(1) de la table.
-* **Ordre de coups dynamique** selon la phase (début / milieu / fin).
 * **Monte‑Carlo Tree Search** guidé par un réseau léger pour explorer plus profondément.
 
-## 8. Licence
-
-MIT (voir `LICENSE`).
